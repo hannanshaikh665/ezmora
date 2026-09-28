@@ -98,6 +98,18 @@ export const requireSupabaseAuth = createMiddleware({ type: 'function' }).server
       throw new Error('Unauthorized: No user ID found in token');
     }
 
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('access_status')
+      .eq('id', data.claims.sub)
+      .maybeSingle();
+    if (profileError) {
+      throw new Error('Unauthorized: Could not verify account access');
+    }
+    if (profile?.access_status && profile.access_status !== 'active') {
+      throw new Error(`Unauthorized: Account is ${profile.access_status.replace('_', ' ')}`);
+    }
+
     return next({
       context: {
         supabase,

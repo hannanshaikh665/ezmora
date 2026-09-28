@@ -14,6 +14,33 @@ export type Database = {
   }
   public: {
     Tables: {
+      access_audit_logs: {
+        Row: {
+          action: string
+          actor_id: string
+          created_at: string
+          details: Json
+          id: string
+          target_user_id: string
+        }
+        Insert: {
+          action: string
+          actor_id: string
+          created_at?: string
+          details?: Json
+          id?: string
+          target_user_id: string
+        }
+        Update: {
+          action?: string
+          actor_id?: string
+          created_at?: string
+          details?: Json
+          id?: string
+          target_user_id?: string
+        }
+        Relationships: []
+      }
       blast_recipients: {
         Row: {
           attempts: number
@@ -351,6 +378,7 @@ export type Database = {
       }
       profiles: {
         Row: {
+          access_status: string
           branch: string | null
           created_at: string
           designation: string | null
@@ -358,9 +386,12 @@ export type Database = {
           full_name: string
           id: string
           is_active: boolean
+          last_active_at: string | null
+          last_login_at: string | null
           phone: string | null
         }
         Insert: {
+          access_status?: string
           branch?: string | null
           created_at?: string
           designation?: string | null
@@ -368,9 +399,12 @@ export type Database = {
           full_name?: string
           id: string
           is_active?: boolean
+          last_active_at?: string | null
+          last_login_at?: string | null
           phone?: string | null
         }
         Update: {
+          access_status?: string
           branch?: string | null
           created_at?: string
           designation?: string | null
@@ -378,6 +412,8 @@ export type Database = {
           full_name?: string
           id?: string
           is_active?: boolean
+          last_active_at?: string | null
+          last_login_at?: string | null
           phone?: string | null
         }
         Relationships: []

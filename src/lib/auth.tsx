@@ -13,6 +13,9 @@ type Profile = {
   designation: string | null;
   branch: string | null;
   is_active: boolean;
+  access_status: "active" | "locked" | "disabled" | "login_removed";
+  last_active_at: string | null;
+  last_login_at: string | null;
 };
 
 type AuthValue = {
@@ -70,6 +73,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       };
     },
   });
+
+  useEffect(() => {
+    if (!userId || !data?.profile || data.profile.access_status !== "active") return;
+    void supabase
+      .from("profiles")
+      .update({ last_active_at: new Date().toISOString() })
+      .eq("id", userId);
+  }, [data?.profile, userId]);
 
   const roles = data?.roles ?? [];
   const role: AppRole = roles.includes("owner")
