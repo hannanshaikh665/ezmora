@@ -49,14 +49,6 @@ type ManualContact = {
 const CALL_RETURN_KEY = "ezmora-call-return";
 
 /**
- * A browser cannot read the telephony state directly, so connection is derived
- * from how long the user stayed inside the phone app after the dialer opened.
- * Anything shorter than this window is treated as ringing only (not connected)
- * and this ring allowance is never counted as talk time.
- */
-const RING_GRACE_SECONDS = 12;
-
-/**
  * Opens the native dialer without navigating the CRM page away, so the app is
  * still loaded (and refocused) the moment the call ends.
  * We also set a sessionStorage marker so that if the automatic redirect fails
@@ -86,9 +78,7 @@ function CallingPage() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [seconds, setSeconds] = useState(0);
   const [connected, setConnected] = useState(false);
-  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const phaseRef = useRef<Phase>("idle");
-  const awayStartRef = useRef<number | null>(null);
   const finishRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
@@ -182,12 +172,6 @@ function CallingPage() {
     onError: (error: Error) => toast.error(error.message),
   });
 
-  useEffect(() => {
-    return () => {
-      if (timer.current) clearInterval(timer.current);
-    };
-  }, []);
-
   function resetForm() {
     setName("");
     setLookingFor("");
@@ -205,58 +189,32 @@ function CallingPage() {
     beginCall(current.phone);
   }
 
-  function stopTimer() {
-    if (timer.current) clearInterval(timer.current);
-    timer.current = null;
-  }
-
-  /** Elapsed seconds spent inside the phone app since the dialer opened. */
-  function awaySeconds() {
-    if (awayStartRef.current == null) return 0;
-    return Math.max(0, Math.round((Date.now() - awayStartRef.current) / 1000));
-  }
-
   function beginCall(phone: string) {
-    stopTimer();
     setSeconds(0);
     setConnected(false);
     setPhase("dialing");
-    awayStartRef.current = Date.now();
-    timer.current = setInterval(() => {
-      const away = awaySeconds();
-      if (away > RING_GRACE_SECONDS) {
-        setConnected(true);
-        setSeconds(away - RING_GRACE_SECONDS);
-      }
-    }, 500);
     launchDialer(phone);
   }
 
   /**
-   * Called the moment the CRM is focused again (call ended / hung up) — stops
-   * the timer and decides connected vs missed automatically.
+   * The browser `tel:` flow exposes no reliable answered/connected signal.
+   * Returning from the native dialer therefore only ends the local ringing
+   * state; it must never be interpreted as proof that the call was answered.
+   * This safely records an unknown/not-connected call with zero talk time,
+   * including carrier/network announcements.
    */
   function finishCall() {
     if (phaseRef.current !== "dialing") return;
-    const away = awaySeconds();
-    stopTimer();
-    awayStartRef.current = null;
-    if (away <= RING_GRACE_SECONDS) {
-      setSeconds(0);
-      setConnected(false);
-      setPhase("idle");
-      toast.info("Not connected — ringing time isn't logged as call duration");
-      logCall.mutate({
-        connected: false,
-        outcome: "not connected",
-        status: "not connected",
-        duration: 0,
-      });
-      return;
-    }
-    setConnected(true);
-    setSeconds(away - RING_GRACE_SECONDS);
-    setPhase("outcome");
+    setSeconds(0);
+    setConnected(false);
+    setPhase("idle");
+    toast.info("Call state unavailable — recorded as not connected with 0 talk time");
+    logCall.mutate({
+      connected: false,
+      outcome: "unknown — native dialer state unavailable",
+      status: "not connected",
+      duration: 0,
+    });
   }
 
   finishRef.current = finishCall;
@@ -455,7 +413,7 @@ function CallingPage() {
                       {connected ? formatDuration(seconds) : "--:--"}
                     </span>
                     <span className="text-xs text-muted-foreground">
-                      {connected ? "connected — timer running" : "ringing… timer starts when answered"}
+                      {connected ? "connected — timer running" : "ringing… connection state unavailable"}
                     </span>
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -464,8 +422,8 @@ function CallingPage() {
                     </Button>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    Status and duration are detected automatically when you come back from the
-                    phone app.
+                    The browser cannot read native answered/connected state, so this call is never
+                    marked connected automatically.
                   </p>
                 </div>
               )}
