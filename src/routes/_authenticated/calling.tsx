@@ -89,6 +89,7 @@ function CallingPage() {
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const phaseRef = useRef<Phase>("idle");
   const awayStartRef = useRef<number | null>(null);
+  const leftDialerRef = useRef(false);
   const finishRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
@@ -222,6 +223,7 @@ function CallingPage() {
     setConnected(false);
     setPhase("dialing");
     awayStartRef.current = Date.now();
+    leftDialerRef.current = false;
     timer.current = setInterval(() => {
       const away = awaySeconds();
       if (away > RING_GRACE_SECONDS) {
@@ -241,6 +243,7 @@ function CallingPage() {
     const away = awaySeconds();
     stopTimer();
     awayStartRef.current = null;
+    leftDialerRef.current = false;
     if (away <= RING_GRACE_SECONDS) {
       setSeconds(0);
       setConnected(false);
@@ -262,14 +265,29 @@ function CallingPage() {
   finishRef.current = finishCall;
 
   useEffect(() => {
-    function onVisible() {
-      if (document.visibilityState === "visible") finishRef.current?.();
+    function markDialerOpen() {
+      if (phaseRef.current === "dialing" || awayStartRef.current !== null) {
+        leftDialerRef.current = true;
+      }
     }
-    document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", onVisible);
+    function onReturn() {
+      // A focus event can fire immediately after launching `tel:`. Only a
+      // genuine leave-and-return transition may finalize the native call.
+      if (document.visibilityState === "visible" && leftDialerRef.current) {
+        finishRef.current?.();
+      }
+    }
+    function handleVisibilityChange() {
+      if (document.visibilityState === "hidden") markDialerOpen();
+      else onReturn();
+    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("blur", markDialerOpen);
+    window.addEventListener("focus", onReturn);
     return () => {
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", onVisible);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("blur", markDialerOpen);
+      window.removeEventListener("focus", onReturn);
     };
   }, []);
 
