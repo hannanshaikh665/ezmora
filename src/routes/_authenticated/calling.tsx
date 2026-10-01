@@ -49,6 +49,14 @@ type ManualContact = {
 const CALL_RETURN_KEY = "ezmora-call-return";
 
 /**
+ * A browser cannot read the telephony state directly, so connection is derived
+ * from how long the user stayed inside the phone app after the dialer opened.
+ * Anything shorter than this window is treated as ringing only (not connected)
+ * and this ring allowance is never counted as talk time.
+ */
+const RING_GRACE_SECONDS = 12;
+
+/**
  * Opens the native dialer without navigating the CRM page away, so the app is
  * still loaded (and refocused) the moment the call ends.
  * We also set a sessionStorage marker so that if the automatic redirect fails
@@ -78,7 +86,10 @@ function CallingPage() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [seconds, setSeconds] = useState(0);
   const [connected, setConnected] = useState(false);
+  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
   const phaseRef = useRef<Phase>("idle");
+  const awayStartRef = useRef<number | null>(null);
+  const finishRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     phaseRef.current = phase;
@@ -171,6 +182,12 @@ function CallingPage() {
     onError: (error: Error) => toast.error(error.message),
   });
 
+  useEffect(() => {
+    return () => {
+      if (timer.current) clearInterval(timer.current);
+    };
+  }, []);
+
   function resetForm() {
     setName("");
     setLookingFor("");
@@ -188,32 +205,73 @@ function CallingPage() {
     beginCall(current.phone);
   }
 
+  function stopTimer() {
+    if (timer.current) clearInterval(timer.current);
+    timer.current = null;
+  }
+
+  /** Elapsed seconds spent inside the phone app since the dialer opened. */
+  function awaySeconds() {
+    if (awayStartRef.current == null) return 0;
+    return Math.max(0, Math.round((Date.now() - awayStartRef.current) / 1000));
+  }
+
   function beginCall(phone: string) {
+    stopTimer();
     setSeconds(0);
     setConnected(false);
     setPhase("dialing");
+    awayStartRef.current = Date.now();
+    timer.current = setInterval(() => {
+      const away = awaySeconds();
+      if (away > RING_GRACE_SECONDS) {
+        setConnected(true);
+        setSeconds(away - RING_GRACE_SECONDS);
+      }
+    }, 500);
     launchDialer(phone);
   }
 
   /**
-   * The browser `tel:` flow exposes no reliable answered/connected signal.
-   * A native-dialer return or elapsed time must never be treated as proof of
-   * connection, so the explicit end action safely records not connected with
-   * zero talk time.
+   * Called the moment the CRM is focused again (call ended / hung up) — stops
+   * the timer and decides connected vs missed automatically.
    */
   function finishCall() {
     if (phaseRef.current !== "dialing") return;
-    setSeconds(0);
-    setConnected(false);
-    setPhase("idle");
-    toast.info("No reliable connection signal — recorded as not connected");
-    logCall.mutate({
-      connected: false,
-      outcome: "not connected — native dialer state unavailable",
-      status: "not connected",
-      duration: 0,
-    });
+    const away = awaySeconds();
+    stopTimer();
+    awayStartRef.current = null;
+    if (away <= RING_GRACE_SECONDS) {
+      setSeconds(0);
+      setConnected(false);
+      setPhase("idle");
+      toast.info("Not connected — ringing time isn't logged as call duration");
+      logCall.mutate({
+        connected: false,
+        outcome: "not connected",
+        status: "not connected",
+        duration: 0,
+      });
+      return;
+    }
+    setConnected(true);
+    setSeconds(away - RING_GRACE_SECONDS);
+    setPhase("outcome");
   }
+
+  finishRef.current = finishCall;
+
+  useEffect(() => {
+    function onVisible() {
+      if (document.visibilityState === "visible") finishRef.current?.();
+    }
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
+  }, []);
 
   const logCall = useMutation({
     mutationFn: async (args: {
@@ -397,7 +455,7 @@ function CallingPage() {
                       {connected ? formatDuration(seconds) : "--:--"}
                     </span>
                     <span className="text-xs text-muted-foreground">
-                      {connected ? "connected — timer running" : "ringing… connection state unavailable"}
+                      {connected ? "connected — timer running" : "ringing… timer starts when answered"}
                     </span>
                   </div>
                   <div className="flex flex-wrap gap-2">
@@ -406,8 +464,8 @@ function CallingPage() {
                     </Button>
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    The browser cannot read native answered/connected state, so this call is not
-                    marked connected automatically.
+                    Status and duration are detected automatically when you come back from the
+                    phone app.
                   </p>
                 </div>
               )}
