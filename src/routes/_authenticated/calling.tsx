@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute } from "@tanstack/react-router";
 import { Phone, PhoneOff, PhoneOutgoing, SkipForward, Timer } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Empty, PageHeader, Panel } from "@/components/GlassBits";
@@ -48,6 +48,13 @@ type ManualContact = {
 
 const CALL_RETURN_KEY = "ezmora-call-return";
 
+type ActiveCall = {
+  contactId: string;
+  startedAt: number;
+  rowId: string | null;
+  resolved: boolean;
+};
+
 /**
  * Opens the native dialer without navigating the CRM page away, so the app is
  * still loaded (and refocused) the moment the call ends.
@@ -78,6 +85,7 @@ function CallingPage() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [seconds, setSeconds] = useState(0);
   const [connected, setConnected] = useState(false);
+  const activeCallRef = useRef<ActiveCall | null>(null);
 
   const [manual, setManual] = useState<ManualContact | null>(null);
   const [manualPhone, setManualPhone] = useState("");
@@ -132,6 +140,63 @@ function CallingPage() {
   const queue = queueQuery.data ?? [];
   const current = manual ?? queue[0];
 
+  useEffect(() => {
+    if (phase !== "dialing" || !userId || !activeCallRef.current) return;
+
+    let stopped = false;
+    const checkNativeResult = async () => {
+      const activeCall = activeCallRef.current;
+      if (!activeCall || activeCall.resolved) return;
+
+      const from = new Date(activeCall.startedAt - 10 * 60 * 1000).toISOString();
+      const { data, error } = await supabase
+        .from("calls")
+        .select("id, connected, duration_seconds, outcome, source, created_at")
+        .eq("employee_id", userId)
+        .eq("contact_id", activeCall.contactId)
+        .eq("source", "android-call-log")
+        .gte("created_at", from)
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (stopped || error || !data?.[0]) return;
+      const row = data[0] as {
+        id: string;
+        connected: boolean;
+        duration_seconds: number | null;
+        outcome: string | null;
+      };
+      activeCall.resolved = true;
+      activeCall.rowId = row.id;
+      const duration = Math.max(0, Number(row.duration_seconds ?? 0));
+
+      if (row.connected && duration > 0) {
+        setConnected(true);
+        setSeconds(duration);
+        setPhase("outcome");
+        toast.success(`Connected — ${formatDuration(duration)}`);
+        return;
+      }
+
+      await supabase.from("contacts").update({ status: "skipped" }).eq("id", activeCall.contactId);
+      setSeconds(0);
+      setConnected(false);
+      setPhase("idle");
+      setManual(null);
+      activeCallRef.current = null;
+      void queryClient.invalidateQueries({ queryKey: ["dial-queue"] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      toast.info("Not connected — moving to the next number");
+    };
+
+    void checkNativeResult();
+    const timer = window.setInterval(() => void checkNativeResult(), 2000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [phase, queryClient, userId]);
+
 
   const startManualCall = useMutation({
     mutationFn: async () => {
@@ -183,10 +248,38 @@ function CallingPage() {
     beginCall(current.phone);
   }
 
-  function beginCall(phone: string) {
+  async function beginCall(phone: string) {
+    if (!current || !userId) return;
+    const startedAt = Date.now();
+    activeCallRef.current = {
+      contactId: current.id,
+      startedAt,
+      rowId: null,
+      resolved: false,
+    };
     setSeconds(0);
     setConnected(false);
     setPhase("dialing");
+
+    const { data, error } = await supabase
+      .from("calls")
+      .insert({
+        contact_id: current.id,
+        employee_id: userId,
+        phone: current.phone,
+        connected: false,
+        duration_seconds: 0,
+        outcome: "dialing — awaiting native result",
+        source: "crm",
+      })
+      .select("id")
+      .single();
+
+    if (error) {
+      toast.error("Call tracking could not start; the call will still open");
+    } else if (activeCallRef.current) {
+      activeCallRef.current.rowId = data.id;
+    }
     launchDialer(phone);
   }
 
@@ -196,11 +289,10 @@ function CallingPage() {
    * Do not create a provisional call here or guess connected state.
    */
   function finishCall() {
-    setSeconds(0);
-    setConnected(false);
-    setPhase("idle");
-    setManual(null);
-    toast.info("Call ended — Android companion will sync the native result");
+    void (async () => {
+      await supabase.auth.getSession();
+      toast.info("Waiting for the native call result — no manual status was assumed");
+    })();
   }
 
   const logCall = useMutation({
@@ -234,14 +326,24 @@ function CallingPage() {
       const finalLocality = customLocality.trim() || locality || null;
       const currentDataset =
         (current as { dataset_id?: string | null }).dataset_id ?? (datasetId || null);
-      await supabase.from("calls").insert({
-        contact_id: current.id,
-        employee_id: userId,
-        phone: current.phone,
-        connected: true,
-        duration_seconds: seconds,
-        outcome: "lead captured",
-      });
+      const activeCall = activeCallRef.current;
+      if (activeCall?.rowId) {
+        const { error: callError } = await supabase
+          .from("calls")
+          .update({ connected: true, duration_seconds: seconds, outcome: "lead captured" })
+          .eq("id", activeCall.rowId);
+        if (callError) throw callError;
+      } else {
+        await supabase.from("calls").insert({
+          contact_id: current.id,
+          employee_id: userId,
+          phone: current.phone,
+          connected: true,
+          duration_seconds: seconds,
+          outcome: "lead captured",
+          source: "crm",
+        });
+      }
       const { error } = await supabase.from("leads").insert({
         contact_id: current.id,
         name: name.trim() || current.name,
@@ -278,6 +380,7 @@ function CallingPage() {
       setPhase("idle");
       setSeconds(0);
       setManual(null);
+      activeCallRef.current = null;
       void queryClient.invalidateQueries({ queryKey: ["dial-queue"] });
       void queryClient.invalidateQueries({ queryKey: ["leads"] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
