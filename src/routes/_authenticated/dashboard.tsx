@@ -104,6 +104,8 @@ function Dashboard() {
   const { data } = useQuery({
     queryKey: ["dashboard", userId, isManager, period.start, period.end],
     enabled: Boolean(userId),
+    refetchInterval: 15000,
+    refetchOnWindowFocus: true,
     queryFn: async () => {
       const [calls, leads, visits, tasks, queue, members] = await Promise.all([
         supabase
