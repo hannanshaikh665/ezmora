@@ -89,6 +89,7 @@ function CallingPage() {
   const [syncUnavailable, setSyncUnavailable] = useState(false);
   const activeCallRef = useRef<ActiveCall | null>(null);
   const dialerOpenedAtRef = useRef<number | null>(null);
+  const dialerLeftRef = useRef(false);
 
   const [manual, setManual] = useState<ManualContact | null>(null);
   const [manualPhone, setManualPhone] = useState("");
@@ -235,19 +236,26 @@ function CallingPage() {
   useEffect(() => {
     if (phase !== "dialing") return;
 
+    const markDialerLeft = () => {
+      if (activeCallRef.current) dialerLeftRef.current = true;
+    };
     const markDialerReturned = () => {
       const openedAt = dialerOpenedAtRef.current;
       // The first focus/visibility event can be emitted while the tel: intent
       // is still opening. It only changes the UI to syncing; it never decides
       // whether the call was connected.
-      if (!openedAt || Date.now() - openedAt < 1_200 || !activeCallRef.current) return;
+      if (!openedAt || Date.now() - openedAt < 1_200 || !activeCallRef.current || !dialerLeftRef.current) return;
       setPhase("syncing");
       setSyncMessage("Call ended — syncing result");
     };
 
+    window.addEventListener("blur", markDialerLeft);
+    window.addEventListener("pagehide", markDialerLeft);
     document.addEventListener("visibilitychange", markDialerReturned);
     window.addEventListener("focus", markDialerReturned);
     return () => {
+      window.removeEventListener("blur", markDialerLeft);
+      window.removeEventListener("pagehide", markDialerLeft);
       document.removeEventListener("visibilitychange", markDialerReturned);
       window.removeEventListener("focus", markDialerReturned);
     };
@@ -318,6 +326,7 @@ function CallingPage() {
     setSyncUnavailable(false);
     setSyncMessage("Waiting for the Android companion result");
     dialerOpenedAtRef.current = startedAt;
+    dialerLeftRef.current = false;
     setPhase("dialing");
 
     const { data, error } = await supabase
