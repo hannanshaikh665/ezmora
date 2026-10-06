@@ -155,6 +155,8 @@ export type Database = {
           id: string
           outcome: string | null
           phone: string | null
+          device_call_id: string | null
+          source: string
         }
         Insert: {
           connected?: boolean
@@ -165,6 +167,8 @@ export type Database = {
           id?: string
           outcome?: string | null
           phone?: string | null
+          device_call_id?: string | null
+          source?: string
         }
         Update: {
           connected?: boolean
@@ -175,6 +179,8 @@ export type Database = {
           id?: string
           outcome?: string | null
           phone?: string | null
+          device_call_id?: string | null
+          source?: string
         }
         Relationships: [
           {

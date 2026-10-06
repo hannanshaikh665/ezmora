@@ -36,7 +36,7 @@ export const Route = createFileRoute("/_authenticated/calling")({
   component: CallingPage,
 });
 
-type Phase = "idle" | "dialing" | "outcome" | "capture";
+type Phase = "idle" | "dialing" | "syncing" | "outcome" | "capture";
 
 type ManualContact = {
   id: string;
@@ -48,13 +48,12 @@ type ManualContact = {
 
 const CALL_RETURN_KEY = "ezmora-call-return";
 
-/**
- * A browser cannot read the telephony state directly, so connection is derived
- * from how long the user stayed inside the phone app after the dialer opened.
- * Anything shorter than this window is treated as ringing only (not connected)
- * and this ring allowance is never counted as talk time.
- */
-const RING_GRACE_SECONDS = 12;
+type ActiveCall = {
+  contactId: string;
+  startedAt: number;
+  rowId: string | null;
+  resolved: boolean;
+};
 
 /**
  * Opens the native dialer without navigating the CRM page away, so the app is
@@ -86,14 +85,11 @@ function CallingPage() {
   const [phase, setPhase] = useState<Phase>("idle");
   const [seconds, setSeconds] = useState(0);
   const [connected, setConnected] = useState(false);
-  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
-  const phaseRef = useRef<Phase>("idle");
-  const awayStartRef = useRef<number | null>(null);
-  const finishRef = useRef<(() => void) | null>(null);
-
-  useEffect(() => {
-    phaseRef.current = phase;
-  }, [phase]);
+  const [syncMessage, setSyncMessage] = useState("Waiting for the Android companion result");
+  const [syncUnavailable, setSyncUnavailable] = useState(false);
+  const activeCallRef = useRef<ActiveCall | null>(null);
+  const dialerOpenedAtRef = useRef<number | null>(null);
+  const dialerLeftRef = useRef(false);
 
   const [manual, setManual] = useState<ManualContact | null>(null);
   const [manualPhone, setManualPhone] = useState("");
@@ -126,6 +122,25 @@ function CallingPage() {
 
   const datasets = datasetsQuery.data ?? [];
 
+  const companionStatusQuery = useQuery({
+    queryKey: ["calling-companion-status", userId],
+    enabled: Boolean(userId),
+    refetchInterval: 5000,
+    queryFn: async () => {
+      if (!userId) return null;
+      const { data, error } = await supabase
+        .from("calls")
+        .select("created_at, source")
+        .eq("employee_id", userId)
+        .eq("source", "android-call-log")
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) throw error;
+      return data;
+    },
+  });
+
   const queueQuery = useQuery({
     queryKey: ["dial-queue", userId, datasetId],
     enabled: Boolean(userId),
@@ -147,6 +162,109 @@ function CallingPage() {
 
   const queue = queueQuery.data ?? [];
   const current = manual ?? queue[0];
+
+  useEffect(() => {
+    if ((phase !== "dialing" && phase !== "syncing") || !userId || !activeCallRef.current) return;
+
+    let stopped = false;
+    const checkNativeResult = async () => {
+      const activeCall = activeCallRef.current;
+      if (!activeCall || activeCall.resolved) return;
+
+      const from = new Date(activeCall.startedAt - 10 * 60 * 1000).toISOString();
+      const { data, error } = await supabase
+        .from("calls")
+        .select("id, connected, duration_seconds, outcome, source, created_at")
+        .eq("employee_id", userId)
+        .eq("contact_id", activeCall.contactId)
+        .eq("source", "android-call-log")
+        .gte("created_at", from)
+        .order("created_at", { ascending: false })
+        .limit(1);
+
+      if (stopped) return;
+      if (error) {
+        setSyncMessage("Sync failed — retrying");
+        return;
+      }
+      if (!data?.[0]) return;
+      const row = data[0] as {
+        id: string;
+        connected: boolean;
+        duration_seconds: number | null;
+        outcome: string | null;
+      };
+      activeCall.resolved = true;
+      activeCall.rowId = row.id;
+      const duration = Math.max(0, Number(row.duration_seconds ?? 0));
+
+      if (row.connected && duration > 0) {
+        setConnected(true);
+        setSeconds(duration);
+        setPhase("outcome");
+        setSyncUnavailable(false);
+        toast.success(`Connected — ${formatDuration(duration)}`);
+        return;
+      }
+
+      await supabase.from("contacts").update({ status: "skipped" }).eq("id", activeCall.contactId);
+      setSeconds(0);
+      setConnected(false);
+      setPhase("idle");
+      setManual(null);
+      activeCallRef.current = null;
+      setSyncUnavailable(false);
+      void queryClient.invalidateQueries({ queryKey: ["dial-queue"] });
+      void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      toast.info("Not connected — moving to the next number");
+    };
+
+    setSyncMessage("Syncing call result from Android…");
+    void checkNativeResult();
+    const timer = window.setInterval(() => void checkNativeResult(), 2000);
+    const unavailableTimer = window.setTimeout(() => {
+      if (stopped || activeCallRef.current?.resolved) return;
+      setSyncUnavailable(true);
+      setSyncMessage("Result unavailable — retry sync");
+    }, 60_000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+      window.clearTimeout(unavailableTimer);
+    };
+  }, [phase, queryClient, userId]);
+
+  useEffect(() => {
+    if (phase !== "dialing") return;
+
+    const markDialerLeft = () => {
+      if (activeCallRef.current) dialerLeftRef.current = true;
+    };
+    const markDialerReturned = () => {
+      const openedAt = dialerOpenedAtRef.current;
+      // The first focus/visibility event can be emitted while the tel: intent
+      // is still opening. It only changes the UI to syncing; it never decides
+      // whether the call was connected.
+      if (!openedAt || Date.now() - openedAt < 1_200 || !activeCallRef.current || !dialerLeftRef.current) return;
+      setPhase("syncing");
+      setSyncMessage("Call ended — syncing result");
+    };
+    const handleVisibility = () => {
+      if (document.visibilityState === "hidden") markDialerLeft();
+      else markDialerReturned();
+    };
+
+    window.addEventListener("blur", markDialerLeft);
+    window.addEventListener("pagehide", markDialerLeft);
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", markDialerReturned);
+    return () => {
+      window.removeEventListener("blur", markDialerLeft);
+      window.removeEventListener("pagehide", markDialerLeft);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", markDialerReturned);
+    };
+  }, [phase]);
 
 
   const startManualCall = useMutation({
@@ -182,12 +300,6 @@ function CallingPage() {
     onError: (error: Error) => toast.error(error.message),
   });
 
-  useEffect(() => {
-    return () => {
-      if (timer.current) clearInterval(timer.current);
-    };
-  }, []);
-
   function resetForm() {
     setName("");
     setLookingFor("");
@@ -205,73 +317,64 @@ function CallingPage() {
     beginCall(current.phone);
   }
 
-  function stopTimer() {
-    if (timer.current) clearInterval(timer.current);
-    timer.current = null;
-  }
-
-  /** Elapsed seconds spent inside the phone app since the dialer opened. */
-  function awaySeconds() {
-    if (awayStartRef.current == null) return 0;
-    return Math.max(0, Math.round((Date.now() - awayStartRef.current) / 1000));
-  }
-
-  function beginCall(phone: string) {
-    stopTimer();
+  async function beginCall(phone: string) {
+    if (!current || !userId) return;
+    const startedAt = Date.now();
+    activeCallRef.current = {
+      contactId: current.id,
+      startedAt,
+      rowId: null,
+      resolved: false,
+    };
     setSeconds(0);
     setConnected(false);
+    setSyncUnavailable(false);
+    setSyncMessage("Waiting for the Android companion result");
+    dialerOpenedAtRef.current = startedAt;
+    dialerLeftRef.current = false;
     setPhase("dialing");
-    awayStartRef.current = Date.now();
-    timer.current = setInterval(() => {
-      const away = awaySeconds();
-      if (away > RING_GRACE_SECONDS) {
-        setConnected(true);
-        setSeconds(away - RING_GRACE_SECONDS);
-      }
-    }, 500);
+
+    const { data, error } = await supabase
+      .from("calls")
+      .insert({
+        contact_id: current.id,
+        employee_id: userId,
+        phone: current.phone,
+        connected: false,
+        duration_seconds: 0,
+        outcome: "dialing — awaiting native result",
+        source: "crm",
+      })
+      .select("id")
+      .single();
+
+    if (error) {
+      toast.error("Call tracking could not start; the call will still open");
+    } else if (activeCallRef.current) {
+      activeCallRef.current.rowId = data.id;
+    }
     launchDialer(phone);
   }
 
   /**
-   * Called the moment the CRM is focused again (call ended / hung up) — stops
-   * the timer and decides connected vs missed automatically.
+   * The browser cannot read native dialer state. The Android companion reads
+   * the finalized device call log and writes the authoritative result to CRM.
+   * Do not create a provisional call here or guess connected state.
    */
   function finishCall() {
-    if (phaseRef.current !== "dialing") return;
-    const away = awaySeconds();
-    stopTimer();
-    awayStartRef.current = null;
-    if (away <= RING_GRACE_SECONDS) {
-      setSeconds(0);
-      setConnected(false);
-      setPhase("idle");
-      toast.info("Not connected — ringing time isn't logged as call duration");
-      logCall.mutate({
-        connected: false,
-        outcome: "not connected",
-        status: "not connected",
-        duration: 0,
-      });
-      return;
-    }
-    setConnected(true);
-    setSeconds(away - RING_GRACE_SECONDS);
-    setPhase("outcome");
+    if (!activeCallRef.current) return;
+    setPhase("syncing");
+    setSyncUnavailable(false);
+    setSyncMessage("Call ended — syncing result");
+    toast.info("Call ended — syncing the native result");
   }
 
-  finishRef.current = finishCall;
-
-  useEffect(() => {
-    function onVisible() {
-      if (document.visibilityState === "visible") finishRef.current?.();
-    }
-    document.addEventListener("visibilitychange", onVisible);
-    window.addEventListener("focus", onVisible);
-    return () => {
-      document.removeEventListener("visibilitychange", onVisible);
-      window.removeEventListener("focus", onVisible);
-    };
-  }, []);
+  function retryNativeSync() {
+    if (!activeCallRef.current) return;
+    setSyncUnavailable(false);
+    setSyncMessage("Retrying Android call-log sync…");
+    setPhase("syncing");
+  }
 
   const logCall = useMutation({
     mutationFn: async (args: {
@@ -281,20 +384,36 @@ function CallingPage() {
       duration: number;
     }) => {
       if (!current || !userId) return;
-      await supabase.from("calls").insert({
-        contact_id: current.id,
-        employee_id: userId,
-        phone: current.phone,
-        connected: args.connected,
-        duration_seconds: args.duration,
-        outcome: args.outcome,
-      });
-      await supabase.from("contacts").update({ status: args.status }).eq("id", current.id);
+      const activeCall = activeCallRef.current;
+      if (activeCall?.rowId) {
+        const { error } = await supabase
+          .from("calls")
+          .update({ connected: args.connected, duration_seconds: args.duration, outcome: args.outcome })
+          .eq("id", activeCall.rowId);
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.from("calls").insert({
+          contact_id: current.id,
+          employee_id: userId,
+          phone: current.phone,
+          connected: args.connected,
+          duration_seconds: args.duration,
+          outcome: args.outcome,
+          source: "crm",
+        });
+        if (error) throw error;
+      }
+      const { error: contactError } = await supabase
+        .from("contacts")
+        .update({ status: args.status })
+        .eq("id", current.id);
+      if (contactError) throw contactError;
     },
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["dial-queue"] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
       setManual(null);
+      activeCallRef.current = null;
     },
   });
 
@@ -304,14 +423,24 @@ function CallingPage() {
       const finalLocality = customLocality.trim() || locality || null;
       const currentDataset =
         (current as { dataset_id?: string | null }).dataset_id ?? (datasetId || null);
-      await supabase.from("calls").insert({
-        contact_id: current.id,
-        employee_id: userId,
-        phone: current.phone,
-        connected: true,
-        duration_seconds: seconds,
-        outcome: "lead captured",
-      });
+      const activeCall = activeCallRef.current;
+      if (activeCall?.rowId) {
+        const { error: callError } = await supabase
+          .from("calls")
+          .update({ connected: true, duration_seconds: seconds, outcome: "lead captured" })
+          .eq("id", activeCall.rowId);
+        if (callError) throw callError;
+      } else {
+        await supabase.from("calls").insert({
+          contact_id: current.id,
+          employee_id: userId,
+          phone: current.phone,
+          connected: true,
+          duration_seconds: seconds,
+          outcome: "lead captured",
+          source: "crm",
+        });
+      }
       const { error } = await supabase.from("leads").insert({
         contact_id: current.id,
         name: name.trim() || current.name,
@@ -348,6 +477,7 @@ function CallingPage() {
       setPhase("idle");
       setSeconds(0);
       setManual(null);
+      activeCallRef.current = null;
       void queryClient.invalidateQueries({ queryKey: ["dial-queue"] });
       void queryClient.invalidateQueries({ queryKey: ["leads"] });
       void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
@@ -366,6 +496,19 @@ function CallingPage() {
           </span>
         }
       />
+
+      <div className="mb-4 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+        <span className="rounded-full border border-border/70 px-3 py-1.5">
+          {companionStatusQuery.data?.source === "android-call-log"
+            ? "Companion connected"
+            : "Companion sync pending"}
+        </span>
+        {companionStatusQuery.data?.created_at ? (
+          <span>Last successful sync: {new Date(companionStatusQuery.data.created_at).toLocaleString()}</span>
+        ) : (
+          <span>Open EZMORA Mobile, sign in, and allow call-log permission.</span>
+        )}
+      </div>
 
       {datasets.length > 0 && (
         <div className="mb-4 flex flex-wrap items-center gap-2">
@@ -447,25 +590,34 @@ function CallingPage() {
                 </div>
               )}
 
-              {phase === "dialing" && (
+              {(phase === "dialing" || phase === "syncing") && (
                 <div className="space-y-3">
                   <div className="flex items-center gap-2 rounded-2xl border border-primary/40 bg-primary/5 px-4 py-3">
                     <Timer className="size-4 text-primary" />
                     <span className="font-mono text-lg">
-                      {connected ? formatDuration(seconds) : "--:--"}
+                      {connected ? formatDuration(seconds) : phase === "syncing" ? "--:--" : "--:--"}
                     </span>
                     <span className="text-xs text-muted-foreground">
-                      {connected ? "connected — timer running" : "ringing… timer starts when answered"}
+                      {connected
+                        ? "connected — native result received"
+                        : phase === "syncing"
+                          ? syncMessage
+                          : "ringing… waiting for Android call result"}
                     </span>
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    <Button className="press flex-1" onClick={finishCall}>
+                    <Button className="press flex-1" onClick={finishCall} disabled={phase === "syncing"}>
                       <PhoneOff className="size-4" /> Call ended
                     </Button>
+                    {phase === "syncing" && syncUnavailable && (
+                      <Button variant="secondary" className="press" onClick={retryNativeSync}>
+                        Retry sync
+                      </Button>
+                    )}
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    Status and duration are detected automatically when you come back from the
-                    phone app.
+                    The browser does not guess call state. The EZMORA Android companion syncs the
+                    native result and actual duration after the call.
                   </p>
                 </div>
               )}
